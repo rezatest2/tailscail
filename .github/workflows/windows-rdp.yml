@@ -1,4 +1,3 @@
-
 name: Windows Cloud RDP
 
 on:
@@ -7,51 +6,191 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+
+      - name: 1. Enable Remote Desktop
+        shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 0
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-      - name: 2. Create Admin Account
+          Write-Host "Remote Desktop enabled."
+
+      - name: 2. Create RDP Admin Account
+        shell: powershell
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
+          $Password = ConvertTo-SecureString "CHANGE_THIS_PASSWORD_123!" -AsPlainText -Force
 
-      - name: 3. Install & Connect Tailscale VPN
+          if (-not (Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue)) {
+              New-LocalUser `
+                -Name "NvDAdmin" `
+                -Password $Password `
+                -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "NvDAdmin" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user created."
+
+      - name: 3. Configure RDP Firewall
+        shell: powershell
+        run: |
+          Write-Host "Configuring firewall..."
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Set-NetFirewallRule -Enabled True
+
+          New-NetFirewallRule `
+            -DisplayName "Allow RDP 3389" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -Profile Any `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Firewall configured."
+
+      - name: 4. Test RDP Port
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 5
+
+          Write-Host "Checking RDP service..."
+          Get-Service TermService
+
+          Write-Host ""
+          Write-Host "Checking TCP 3389..."
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389
+
+          $test | Format-List
+
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is NOT listening!"
+              exit 1
+          }
+
+          Write-Host "RDP PORT 3389 IS OPEN!" -ForegroundColor Green
+
+      - name: 5. Install Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Downloading Tailscale..."
+
+          Invoke-WebRequest `
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "C:\tailscale.msi"
+
+          Write-Host "Installing Tailscale..."
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i C:\tailscale.msi /quiet /norestart" `
+            -Wait
+
+          Start-Sleep -Seconds 10
+
+          if (-not (Test-Path "C:\Program Files\Tailscale\tailscale.exe")) {
+              Write-Error "Tailscale installation failed!"
+              exit 1
+          }
+
+          Write-Host "Tailscale installed successfully."
+
+      - name: 6. Connect Tailscale
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Connecting to Tailscale..."
 
-      - name: 4. Keep Server Alive (48 Hours)
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="github-rdp-server"
+
+          Start-Sleep -Seconds 10
+
+          Write-Host ""
+          Write-Host "========== TAILSCALE STATUS =========="
+
+          & "C:\Program Files\Tailscale\tailscale.exe" status
+
+          Write-Host ""
+          Write-Host "========== TAILSCALE IP =========="
+
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+
+          Write-Host $ts_ip -ForegroundColor Green
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "          RDP SERVER READY"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "Tailscale IP:"
+          Write-Host $ts_ip -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "Username:"
+          Write-Host "NvDAdmin" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "RDP Port:"
+          Write-Host "3389" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "Use this IP in Remote Desktop."
+          Write-Host "=========================================="
+
+      - name: 7. Final RDP Test
+        shell: powershell
         run: |
-          for ($i = 1; $i -le 2880; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/2880] Server running..."
+          Start-Sleep -Seconds 5
+
+          Write-Host "Final RDP test..."
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389
+
+          if ($test.TcpTestSucceeded) {
+              Write-Host ""
+              Write-Host "RDP IS WORKING!" -ForegroundColor Green
+              Write-Host ""
+          }
+          else {
+              Write-Error "RDP TEST FAILED!"
+              exit 1
+          }
+
+      - name: 8. Keep Server Alive
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "SERVER IS NOW ONLINE."
+          Write-Host "Do NOT stop this workflow."
+          Write-Host ""
+
+          for ($i = 1; $i -le 340; $i++) {
+              Start-Sleep -Seconds 60
+              Write-Host "[$i/340] Server running..."
           }
